@@ -31,26 +31,21 @@ class ProjectDatabaseSupabase {
         }
     }
 
-    // Get all projects from Supabase with RBAC filtering
-    async getAllProjects(userEmail = null, userRole = null) {
-        console.log('🎯 getAllProjects called with:', { userEmail, userRole });
-        
+    // Get all projects from Supabase
+    async getAllProjects() {
         try {
-            const { data, error } = await databaseService.getProjects(userEmail, userRole);
+            const { data, error } = await databaseService.getProjects();
             if (error) {
-                console.error('❌ Error fetching projects from Supabase:', error);
-                // Fallback to localStorage with client-side filtering
-                return this.filterProjectsByAccess(this.getLocalProjects(), userEmail, userRole);
+                console.error('Error fetching projects from Supabase:', error);
+                // Fallback to localStorage
+                return this.getLocalProjects();
             }
 
             // Always check localStorage as well to ensure we have all projects
             const localProjects = this.getLocalProjects();
-            console.log('💾 Local projects count:', localProjects.length);
 
             // If Supabase returns data, merge with localStorage
             if (data && data.length > 0) {
-                console.log('✅ Supabase returned', data.length, 'projects');
-                
                 // Normalize data: ensure uuid is set (map from id)
                 const supabaseProjects = data.map(p => ({
                     ...p,
@@ -68,29 +63,22 @@ class ProjectDatabaseSupabase {
                         allProjects.push(localProject);
                     }
                 });
-                
-                console.log('🔄 Merged projects count:', allProjects.length);
-                
-                // Apply client-side filtering for merged data
-                const filtered = this.filterProjectsByAccess(allProjects, userEmail, userRole);
-                console.log('🎯 Final filtered projects count:', filtered.length);
-                return filtered;
+                return allProjects;
             } else {
-                console.log('⚠️ Supabase returned no projects, using localStorage');
-                // If Supabase is empty, use localStorage with filtering
-                return this.filterProjectsByAccess(localProjects, userEmail, userRole);
+                // If Supabase is empty, use localStorage
+                return localProjects;
             }
         } catch (error) {
-            console.error('❌ Error in getAllProjects:', error);
-            // Fallback to localStorage with filtering
-            return this.filterProjectsByAccess(this.getLocalProjects(), userEmail, userRole);
+            console.error('Error in getAllProjects:', error);
+            // Fallback to localStorage
+            return this.getLocalProjects();
         }
     }
 
-    // Get all projects from Supabase ordered by creation date with RBAC filtering
-    async getAllProjectsOrdered(userEmail = null, userRole = null) {
+    // Get all projects from Supabase ordered by creation date (no localStorage fallback as requested)
+    async getAllProjectsOrdered() {
         try {
-            const { data, error } = await databaseService.getProjectsOrdered(userEmail, userRole);
+            const { data, error } = await databaseService.getProjectsOrdered();
             if (error) {
                 console.error('Error fetching ordered projects from Supabase:', error);
                 return [];
@@ -100,38 +88,6 @@ class ProjectDatabaseSupabase {
             console.error('Error in getAllProjectsOrdered:', error);
             return [];
         }
-    }
-
-    // Helper method to filter projects by user access
-    filterProjectsByAccess(projects, userEmail, userRole) {
-        console.log('🔍 filterProjectsByAccess:', { 
-            projectCount: projects.length, 
-            userEmail, 
-            userRole 
-        });
-        
-        // Admin can see all projects
-        if (!userEmail || !userRole || userRole.toLowerCase() === 'admin') {
-            console.log('✅ Admin or no user - returning all projects');
-            return projects;
-        }
-
-        // Filter projects where user is in assigned_to_emails
-        const filtered = projects.filter(project => {
-            const assignedEmails = project.assigned_to_emails || project.assignedToEmails || [];
-            const hasAccess = assignedEmails.includes(userEmail);
-            
-            if (!hasAccess) {
-                console.log('🚫 No access to project:', project.project_name || project.projectName, 'assigned_to:', assignedEmails);
-            } else {
-                console.log('✅ Access granted to project:', project.project_name || project.projectName);
-            }
-            
-            return hasAccess;
-        });
-        
-        console.log('🎯 Filtered result:', filtered.length, 'projects accessible');
-        return filtered;
     }
 
     // Get local projects (fallback)
@@ -259,6 +215,14 @@ class ProjectDatabaseSupabase {
                 : [];
             console.log('Transformed teamMembers:', teamMembers);
 
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----START--------------------------------------------------
+            // Extract unique emails from team_members to save in assigned_to_emails
+            const teamMemberEmails = teamMembers.length > 0 
+                ? [...new Set(teamMembers.map(member => member.email))]
+                : [];
+            console.log('Extracted team member emails:', teamMemberEmails);
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----END--------------------------------------------------
+
             // Generate structured ID for the project
             // We construct the payload, then clean it.
             const rawProjectToSave = {
@@ -279,9 +243,11 @@ class ProjectDatabaseSupabase {
                 role_answers: projectData.roleAnswers,
                 custom_questions: projectData.customQuestions,
                 custom_answers: projectData.customAnswers,
-                assigned_to_emails: projectData.assignedToEmails || projectData.assignedTo,
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----START--------------------------------------------------
+                assigned_to_emails: teamMemberEmails.length > 0 ? teamMemberEmails : (projectData.assignedToEmails || projectData.assignedTo),
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----END--------------------------------------------------
                 team_members: teamMembers,
-                project_field: this.mapTechStackToProjectField(projectData.techStack),
+                project_field: this.determineProjectField(projectData),
                 custom_uuid: projectData.custom_uuid || projectData.uuid,
                 organization_id: projectData.organizationId,
             };
@@ -298,14 +264,38 @@ class ProjectDatabaseSupabase {
 
             // Always save to localStorage first as backup
             const localResult = await this.saveProjectLocal(projectData);
-
-            console.log('Sending to Supabase:', projectToSave);
+// SIDDHARTH------DATA_SENDING_TO_BACKEND_API----START---------------
+            console.log('Sending to Backend API:', projectToSave);
             console.log('team_members being sent:', projectToSave.team_members);
 
-            const { data, error } = await databaseService.createProject(projectToSave);
+            // CHANGED: Call Backend API instead of Supabase directly
+            let data = null;
+            let error = null;
+
+            try {
+                const response = await fetch('http://localhost:8000/records/insert/projects', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer webugmate123'
+                    },
+                    body: JSON.stringify(projectToSave)
+                });
+
+                const resJson = await response.json();
+
+                if (response.ok && resJson.success) {
+                    data = resJson.data;
+                } else {
+                    error = { message: resJson.error || 'Start Backend Server: API Error' };
+                }
+            } catch (err) {
+                error = err;
+            }
 
             if (error) {
-                console.error('Error saving project to Supabase:', error);
+                console.error('Error saving project to Backend:', error);
+// SIDDHARTH------DATA_SENDING_TO_BACKEND_API----END------------------------
                 console.error('Error details:', error.message);
                 // Return localStorage result as fallback
                 return localResult;
@@ -391,6 +381,13 @@ class ProjectDatabaseSupabase {
                 })
                 : (Array.isArray(updatedData?.team_members) ? updatedData.team_members : undefined);
 
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----START--------------------------------------------------
+            // Extract unique emails from team_members to save in assigned_to_emails
+            const teamMemberEmails = teamMembers && teamMembers.length > 0 
+                ? [...new Set(teamMembers.map(member => member.email))]
+                : undefined;
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----END--------------------------------------------------
+
             // Map UI fields to DB schema (snake_case) – whitelist known columns
             const update = {
                 project_name: updatedData.project_name ?? updatedData.projectName,
@@ -402,7 +399,11 @@ class ProjectDatabaseSupabase {
                 leader_of_project: updatedData.leader_of_project ?? updatedData.leaderOfProject,
                 project_scope: updatedData.project_scope ?? updatedData.projectScope,
                 project_responsibility: updatedData.project_responsibility ?? updatedData.projectResponsibility,
-                organization_id: updatedData.organization_id ?? updatedData.organizationId
+                organization_id: updatedData.organization_id ?? updatedData.organizationId,
+                team_members: teamMembers,
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----START--------------------------------------------------
+                assigned_to_emails: teamMemberEmails ?? (updatedData.assigned_to_emails ?? updatedData.assignedToEmails)
+// SIDDHARTH-TANMEY------DATA_SENDING_TO_BACKEND_API----END--------------------------------------------------
             };
 
             // Remove undefined/null/empty-string values
@@ -410,10 +411,40 @@ class ProjectDatabaseSupabase {
                 if (update[k] === undefined || update[k] === null || update[k] === '') delete update[k];
             });
 
-            // Perform Supabase update by UUID
-            const { data, error } = await databaseService.updateProject(uuid, update);
+
+// SIDDHARTH------DATA_SENDING_TO_BACKEND_API----START--------------------------------------------------
+            // Perform Supabase update by UUID -> Redirect to Backend API
+            // const { data, error } = await databaseService.updateProject(uuid, update);
+
+            let data = null;
+            let error = null;
+
+            try {
+                // We need to use 'id' or 'uuid' for the route. 
+                // The backend router is /update/<table_name>/<record_id>
+                // Note: 'uuid' arg here is actually the ID used for lookup
+                const response = await fetch(`http://localhost:8000/records/update/projects/${uuid}`, {
+                    method: 'PATCH',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer webugmate123'
+                    },
+                    body: JSON.stringify(update)
+                });
+
+                const resJson = await response.json();
+                if (response.ok && resJson.success) {
+                    data = resJson.data;
+                } else {
+                    error = { message: resJson.error || 'Backend API Error' };
+                }
+            } catch (err) {
+                error = err;
+            }
+
             if (error) {
-                console.warn('Supabase update failed, using local fallback:', error);
+                console.warn('Backend update failed, using local fallback:', error);
+// SIDDHARTH------DATA_SENDING_TO_BACKEND_API----END--------------------------------------------------
                 const localRes = await this.updateProjectLocal(uuid, { ...update, uuid });
                 const localData = localRes?.project ? [localRes.project] : (Array.isArray(localRes) ? localRes : [localRes]);
                 // IMPORTANT: return non-null error so UI knows DB didn't update
@@ -535,60 +566,79 @@ class ProjectDatabaseSupabase {
             };
         }
     }
+    
+// SIDDHARTH------PROJECT_FIELDS_BASE_ON_TECH_STACK_AND_TEAM_ROLES----START---------------
 
-    // Map tech stack to project field
-    mapTechStackToProjectField(techStack) {
-        if (!techStack || !Array.isArray(techStack)) return 'OTHER';
 
-        const techStackStr = techStack.join(' ').toLowerCase();
+    // Determine Project Field based on Tech Stack AND Team Roles
+    determineProjectField(projectData) {
+        const { techStack, teamAssignments, team_members } = projectData;
 
-        // AI/ML related
-        if (techStackStr.includes('ai') || techStackStr.includes('machine learning') ||
-            techStackStr.includes('tensorflow') || techStackStr.includes('pytorch') ||
-            techStackStr.includes('neural') || techStackStr.includes('deep learning')) {
+        let roles = [];
+
+        // Extract roles from teamAssignments (UI format)
+        if (Array.isArray(teamAssignments)) {
+            teamAssignments.forEach(member => {
+                if (member.role) roles.push(member.role.toLowerCase());
+                if (Array.isArray(member.roles)) member.roles.forEach(r => roles.push(r.toLowerCase()));
+            });
+        }
+
+        // Extract roles from team_members (DB format)
+        if (Array.isArray(team_members)) {
+            team_members.forEach(member => {
+                if (member.role) roles.push(member.role.toLowerCase());
+            });
+        }
+
+        const techStackArr = Array.isArray(techStack) ? techStack.map(t => t.toLowerCase()) : [];
+        const techStackStr = techStackArr.join(' ');
+
+        // 1. PRIORITY: Check Roles for AI/ML/Data
+        // If a human is assigned as "AI Engineer", the project is likely AI.
+        const aiRoles = ['ai', 'ai engineer', 'ml', 'machine learning', 'data scientist', 'nlp'];
+        if (roles.some(r => aiRoles.some(ai => r.includes(ai)))) {
             return 'AI';
         }
 
-        // UI/UX related
-        if (techStackStr.includes('figma') || techStackStr.includes('adobe') ||
-            techStackStr.includes('sketch') || techStackStr.includes('ui') ||
-            techStackStr.includes('ux') || techStackStr.includes('design')) {
-            return 'UI/UX';
-        }
+        // 2. Check Tech Stack using strict word matching (avoid 'Tailwind' matching 'ai')
+        const contains = (arr, keywords) => {
+            return arr.some(item => keywords.some(k => item.includes(k)));
+        };
 
-        // Web Development
-        if (techStackStr.includes('react') || techStackStr.includes('angular') ||
-            techStackStr.includes('vue') || techStackStr.includes('html') ||
-            techStackStr.includes('css') || techStackStr.includes('javascript') ||
-            techStackStr.includes('node') || techStackStr.includes('express')) {
-            return 'WEB_DEV';
-        }
-
-        // Mobile Development
-        if (techStackStr.includes('react native') || techStackStr.includes('flutter') ||
-            techStackStr.includes('ios') || techStackStr.includes('android') ||
-            techStackStr.includes('swift') || techStackStr.includes('kotlin')) {
-            return 'MOBILE_DEV';
+        // AI/ML related
+        if (contains(techStackArr, ['ai', 'machine learning', 'tensorflow', 'pytorch', 'neural', 'deep learning', 'openai', 'llm', 'bert', 'gpt'])) {
+            return 'AI';
         }
 
         // Data Science
-        if (techStackStr.includes('python') || techStackStr.includes('r') ||
-            techStackStr.includes('pandas') || techStackStr.includes('numpy') ||
-            techStackStr.includes('jupyter') || techStackStr.includes('data')) {
+        if (contains(techStackArr, ['python', 'pandas', 'numpy', 'jupyter', 'scikit', 'r language', 'big data'])) {
             return 'DATA_SCIENCE';
         }
 
-        // Cloud Computing
-        if (techStackStr.includes('aws') || techStackStr.includes('azure') ||
-            techStackStr.includes('gcp') || techStackStr.includes('cloud') ||
-            techStackStr.includes('docker') || techStackStr.includes('kubernetes')) {
-            return 'CLOUD_COMPUTING';
+        // Mobile Development
+        if (contains(techStackArr, ['react native', 'flutter', 'ios', 'android', 'swift', 'kotlin', 'expo'])) {
+            return 'MOBILE_DEV';
         }
 
         // DevOps
-        if (techStackStr.includes('jenkins') || techStackStr.includes('gitlab') ||
-            techStackStr.includes('ci/cd') || techStackStr.includes('devops')) {
+        if (contains(techStackArr, ['jenkins', 'gitlab', 'ci/cd', 'devops', 'kubernetes', 'docker', 'terraform', 'aws', 'azure'])) {
             return 'DEVOPS';
+        }
+
+        // UI/UX related (Design tools)
+        if (contains(techStackArr, ['figma', 'adobe', 'sketch', 'ui/ux', 'design'])) {
+            return 'UI/UX';
+        }
+
+        // Web Development (Default fallback if React/Node etc are present)
+        if (contains(techStackArr, ['react', 'angular', 'vue', 'html', 'css', 'javascript', 'typescript', 'node', 'express', 'next.js'])) {
+            return 'WEB_DEV';
+        }
+
+        // Cloud Computing (Generic)
+        if (contains(techStackArr, ['cloud', 'gcp', 'serverless'])) {
+            return 'CLOUD_COMPUTING';
         }
 
         return 'OTHER';
@@ -597,7 +647,8 @@ class ProjectDatabaseSupabase {
     // Generate structured project ID with fixed format: WV-A01-AIA01AA-0001
     async generateId(projectData = {}) {
         // Determine project field from tech stack (for tracking purposes only)
-        const projectField = this.mapTechStackToProjectField(projectData.techStack);
+        // CHANGED: Use new logic
+        const projectField = this.determineProjectField(projectData);
 
         try {
             // Try to get serial number from database first
@@ -775,6 +826,7 @@ class ProjectDatabaseSupabase {
         }
     }
 }
+// SIDDHARTH------PROJECT_FIELDS_BASE_ON_TECH_STACK_AND_TEAM_ROLES----END-------------------------
 
 // Create and export a singleton instance
 const projectDatabaseSupabase = new ProjectDatabaseSupabase();
